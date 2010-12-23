@@ -1,12 +1,12 @@
 use strict;
 
-# $Id: RDF.pm,v 1.89 2008/02/24 18:38:07 asc Exp $
+# $Id: RDF.pm,v 1.90 2010/12/19 19:06:12 asc Exp $
 # -*-perl-*- 
 
 package Net::Flickr::RDF;
 use base qw (Net::Flickr::API);
 
-$Net::Flickr::RDF::VERSION = '2.1';
+$Net::Flickr::RDF::VERSION = '2.2';
 
 =head1 NAME
 
@@ -96,25 +96,6 @@ added as properties of the photo's geo:Point description. For example :
 
 Default is false.
 
-=item * <query_trynt_color_api>
-
-Boolean.
-
-If true, the trynt colour extraction web service will be queried with the URL
-for the "medium" sized photo. Each colour will be added as it's own description,
-referenced from the photo's principal description. For example :
-
- <flickr:photo rdf:about="http://www.flickr.com/photos/35034348999@N01/299815039">
-   <trynt:hasColor rdf:resource="http://www.flickr.com/photos/35034348999@N01/299815039#c0c0c0"/>
- </flickr:photo>
-
- <trynt:color rdf:about="http://www.flickr.com/photos/35034348999@N01/299815039#c0c0c0">
-    <trynt:hexidecimal>c0c0c0</trynt:hexidecimal>
-    <trynt:count>654</trynt:count>
- </trynt:color>
-
-Default is false.
-
 =back
 
 =cut
@@ -148,7 +129,6 @@ Readonly::Hash my %DEFAULT_NS => (
 				  "rdf"     => "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
 				  "rdfs"    => "http://www.w3.org/2000/01/rdf-schema#",
 				  "skos"    => "http://www.w3.org/2004/02/skos/core#",
-                                  "trynt"   => "http://www.trynt.com#",
                                   "ymaps"   => "urn:yahoo:maps",
 				  );
 
@@ -322,9 +302,6 @@ Readonly::Hash my %CC_PERMITS => ("by-nc" => {"permits"   => ["Reproduction",
 							     "Attribution"]},
 				  );
 
-Readonly::Scalar my $TRYNT_URL => "http://www.trynt.com/";
-Readonly::Scalar my $TRYNT_API_COLOR_EXTRACT => $TRYNT_URL . "image-color-extract-api/v2";
-
 Readonly::Scalar my $MACHINETAGS_URL   => "http://www.machinetags.org/wiki/";
 
 Readonly::Scalar my $GEONAMES_URL      => "http://www.geonames.org/";
@@ -393,7 +370,7 @@ sub build_photo_uri {
         my $self = shift;
         my $data = shift;
 
-        return sprintf("%s%s/%d", $FLICKR_URL_PHOTOS, $data->{user_id}, $data->{photo_id});
+        return sprintf("%s%s/%s", $FLICKR_URL_PHOTOS, $data->{user_id}, $data->{photo_id});
 }
 
 =head2 __PACKAGE__->build_geo_uri(\%data)
@@ -676,14 +653,16 @@ sub collect_photo_data {
         
         #
         
+	$self->log()->info("fetch exif for photo ID $id (with secret $secret)");
+
         my $exif = $self->api_call({method=>"flickr.photos.getExif",
                                     args=>{photo_id => $id,
-                                           secret   => $secret}});
-        
+                                           secret   => $secret}});       
+
         if ($exif) {
-                foreach my $tag ($exif->findnodes("/rsp/photo/exif[\@tagspace='EXIF']")) {
+                foreach my $tag ($exif->findnodes("/rsp/photo/exif[\@tagspace='EXIF']"), $exif->findnodes("/rsp/photo/exif[\@tagspace='ExifIFD']")) {
                         
-                        my $facet   = $tag->getAttribute("tagspace");
+                        my $facet   = 'EXIF'; # $tag->getAttribute("tagspace");
                         my $tag_dec = $tag->getAttribute("tag");
                         my $value   = $tag->findvalue("clean") || $tag->findvalue("raw");
                         $data{exif}->{$facet}->{$tag_dec} = $value;
@@ -755,6 +734,33 @@ sub collect_photo_data {
                 
                 $data{users}->{$note{author}} = $self->collect_user_data($note{author});
         }    	   
+
+        #
+        # People in photo
+        #
+
+        my $folks = $self->api_call({
+            method => "flickr.photos.people.getList",
+            args   => { photo_id => $id }
+        });
+
+        if ($folks) {
+            foreach my $person ($folks->findnodes("/rsp/people/person")) {
+                $data{people} ||= [];
+
+                my %person = map {
+                    $_ => $person->getAttribute($_)
+                } qw (x y h w username realname);
+                
+                $person{id} = $person->getAttribute('nsid');
+                $person{author} = $person->getAttribute('added_by');
+
+                push @{$data{people}}, \%person;
+
+                $data{users}->{$person{id}} = $self->collect_user_data($person{id});
+                $data{users}->{$person{author}} = $self->collect_user_data($person{author});
+            }
+        }
 
         #
         # Geo
@@ -1066,7 +1072,7 @@ sub make_photo_triples {
         my $self = shift;
         my $data = shift;
 
-        my $photo   = sprintf("%s%s/%d", $FLICKR_URL_PHOTOS, $data->{user_id}, $data->{photo_id});        
+        my $photo   = sprintf("%s%s/%s", $FLICKR_URL_PHOTOS, $data->{user_id}, $data->{photo_id});        
         my @triples = ();
 
         # 
@@ -1091,6 +1097,7 @@ sub make_photo_triples {
         my $flickr_machinetag = $DEFAULT_NS{flickr}."machinetag";
         my $flickr_note       = $DEFAULT_NS{flickr}."note";
         my $flickr_comment    = $DEFAULT_NS{flickr}."comment";
+        my $flickr_persontag  = $DEFAULT_NS{flickr}."persontag";
         my $flickr_group      = $DEFAULT_NS{flickr}."group";
         my $flickr_grouppool  = $DEFAULT_NS{flickr}."grouppool";
         
@@ -1114,6 +1121,10 @@ sub make_photo_triples {
 
         if (exists($data->{comments})) {
                 push @triples, [$flickr_comment, $self->uri_shortform("rdfs","subClassOf"), $anno_annotation];
+        }
+
+        if (exists($data->{people})) {
+                push @triples, [$flickr_persontag, $self->uri_shortform("rdfs","subClassOf"), $anno_annotation];
         }
 
         #
@@ -1172,14 +1183,6 @@ sub make_photo_triples {
 
                 my $geo_url = $self->build_geo_uri($data);
                 push @triples, [$photo, $self->uri_shortform("geo","Point"), $geo_url];
-        }
-
-        #
-        # colour extraction
-        #
-
-        if ($self->{'cfg'}->param('rdf.query_trynt_color_api')) {
-                push @triples, ($self->make_colour_data_triples($data));
         }
 
         #
@@ -1257,6 +1260,33 @@ sub make_photo_triples {
         }
         
         #
+        # people annotations
+        #
+        
+        if (exists($data->{people})) {
+                
+                foreach my $p (@{$data->{people}}) {
+                        
+                        # TO DO : how to build/make note triples without $photo
+                        
+                        my $person     = "$photo#person-$p->{id}";
+                        my $person_uri = $self->build_user_uri($p->{id});
+                        my $author_uri = $self->build_user_uri($p->{author});
+                        
+                        push @triples, [$photo,$self->uri_shortform("a","hasAnnotation"),$person];
+                        
+                        push @triples, [$person,$self->uri_shortform("a","annotates"),$photo];
+                        push @triples, [$person,$self->uri_shortform("a","author"),$author_uri];
+                        push @triples, [$person,$self->uri_shortform("a","personDepicted"),$person_uri];
+                        push @triples, [$person,$self->uri_shortform("a","body"),"$p->{realname} ($p->{username})"];
+                        push @triples, [$person,$self->uri_shortform("i","boundingBox"), "$p->{x} $p->{y} $p->{w} $p->{h}"] if defined $p->{x};
+                        # XXX: Is this correct?  New photo page vs. old photo page show different photos...
+                        push @triples, [$person,$self->uri_shortform("i","regionDepicts"),$data->{files}->{'Medium'}->{'uri'}] if defined $p->{x};
+                        push @triples, [$person,$self->uri_shortform("rdf","type"),$self->uri_shortform("flickr","person")];
+                }
+        }
+        
+        #
         # users (authors)
         #
         
@@ -1293,7 +1323,7 @@ sub make_photo_triples {
 
                 foreach my $tag (keys %{$data->{exif}->{$facet}}) {
                         
-                        my $label = $RDFMAP{$facet}->{$tag};
+                        my $label = $tag =~ /^\d+$/ ? $RDFMAP{$facet}->{$tag} : $tag;
                         
                         if (! $label) {
                                 $self->log()->warning("can't find any label for $facet tag : $tag");
@@ -1304,7 +1334,7 @@ sub make_photo_triples {
 
                         # dateTimeOriginal/Digitized
 
-                        if (($facet eq "EXIF") && (($tag == 36867) || ($tag == 36868))) {
+                        if ( $facet eq "EXIF" and $label =~ /^dateTime(?:Original|Digitized)$/ ) {
 
                                 my $time = str2time($value);
                                 $value   = time2str("%Y-%m-%dT%H:%M:%S%Z", $time);
@@ -1585,7 +1615,7 @@ sub make_geonames_triples {
                 my $photo_url = $self->build_photo_uri($data);
                 my $geo_url = $self->build_geo_uri($data);
 
-                my $geoname_url = sprintf("%s?geonameId=%d", $GEONAMES_URL_RDF, $xml->findvalue("/geonames/geoname/geonameId"));
+                my $geoname_url = sprintf("%s?geonameId=%s", $GEONAMES_URL_RDF, $xml->findvalue("/geonames/geoname/geonameId"));
 
                 #
                 # basic reverse geocoding
@@ -1627,59 +1657,6 @@ sub make_geonames_triples {
 
         #
         # happy happy
-        #
-
-        return (wantarray) ? @triples : \@triples;
-}
-
-sub make_colour_data_triples() {
-        my $self = shift;
-        my $data = shift;
-
-        my @triples = ();
-
-        my $source = $data->{'files'}->{'Medium'}->{'uri'};
-        my $query  = $TRYNT_API_COLOR_EXTRACT ."?u=" . $source . "&c=&fo=xml&f=0";
-        
-        my $res   = undef;
-        my $xml   = undef;
-
-        eval {
-                my $req = HTTP::Request->new(GET => $query);
-                $res = $self->{'api'}->request($req);
-        };
-
-        if ($@) {
-                $self->log()->error("Failed to reach the TRYNT servers, $@");
-                return (wantarray) ? @triples : \@triples;                
-        }
-
-        if ($res->is_success()) {
-                $xml = $self->_parse_results_xml($res);
-        }
-
-        if (! $xml) {
-                $self->log()->error("Failed parse to TRYNT results, $@");
-                return (wantarray) ? @triples : \@triples;
-        }
-
-        #
-
-        my $photo_url = $self->build_photo_uri($data);
-
-        foreach my $node ($xml->findnodes("/trynt/image-color-extract/color/common/data")) {
-                my $hex        = $node->findvalue("color");
-                my $count      = $node->findvalue("count");
-
-                my $colour_url = "$photo_url#". $hex;
-
-                push @triples, [$colour_url, $self->uri_shortform("trynt", "hexidecimal"), $hex];
-                push @triples, [$colour_url, $self->uri_shortform("trynt", "count"),  $count];
-                push @triples, [$colour_url, $self->uri_shortform("rdf","type"),      $self->uri_shortform("trynt","color")];
-
-                push @triples, [$photo_url, $self->uri_shortform("trynt", "hasColor"), $colour_url];
-        }
-
         #
 
         return (wantarray) ? @triples : \@triples;
@@ -1902,10 +1879,6 @@ http://www.w3.org/2000/01/rdf-schema#
 
 http://www.w3.org/2004/02/skos/core#
 
-=item B<trynt>
-
-http://www.trynt.com#
-
 =item B<ymaps>
 
 urn:yahoo:maps
@@ -2118,15 +2091,19 @@ sub places_url {
 
 =head1 VERSION
 
-2.1
+2.2
 
 =head1 DATE
 
-$Date: 2008/02/24 18:38:07 $
+$Date: 2010/12/19 19:06:12 $
 
 =head1 AUTHOR
 
 Aaron Straup Cope E<lt>ascope@cpan.orgE<gt>
+
+=head1 CONTRIBUTORS
+
+Thomas Sibley E<lt>tsibley@cpan.orgE<gt>
 
 =head1 EXAMPLES
 
@@ -2135,7 +2112,7 @@ Aaron Straup Cope E<lt>ascope@cpan.orgE<gt>
 This is an example of a Config::Simple file used to collect RDF data
 from Flickr
 
- [flickr] 
+ [flickr]
  api_key=asd6234kjhdmbzcxi6e323
  api_secret=s00p3rs3k3t
  auth_token=123-omgwtf4u
@@ -2153,7 +2130,6 @@ This is an example of an RDF dump for a photograph backed up from Flickr :
   xmlns:filtr="http://www.machinetags.org/wiki/filtr#process"
   xmlns:ph="http://www.machinetags.org/wiki/ph#camera"
   xmlns:exif="http://nwalsh.com/rdf/exif#"
-  xmlns:trynt="http://www.trynt.com#"
   xmlns:mt="x-urn:flickr:machinetag:"
   xmlns:exifi="http://nwalsh.com/rdf/exif-intrinsic#"
   xmlns:geonames="http://www.machinetags.org/wiki/geonames#locality"
@@ -2198,11 +2174,6 @@ This is an example of an RDF dump for a photograph backed up from Flickr :
     <rdfs:seeAlso rdf:resource="http://www.flickr.com/photos/35034348999@N01/2269291707#exif"/>
  </dcterms:StillImage>
 
- <trynt:color rdf:about="http://www.flickr.com/photos/35034348999@N01/2269291707#c0c0c0">
-    <trynt:hexidecimal>c0c0c0</trynt:hexidecimal>
-    <trynt:count>1617</trynt:count>
- </trynt:color>
-
  <flickr:place rdf:about="http://www.flickr.com/places/United+States/California/San+Francisco">
     <places:locality>San Francisco</places:locality>
     <places:region>California</places:region>
@@ -2211,16 +2182,6 @@ This is an example of an RDF dump for a photograph backed up from Flickr :
     <places:country>United States</places:country>
     <dc:isReferencedBy rdf:resource="http://www.flickr.com/photos/35034348999@N01/2269291707"/>
  </flickr:place>
-
- <trynt:color rdf:about="http://www.flickr.com/photos/35034348999@N01/2269291707#200000">
-    <trynt:hexidecimal>200000</trynt:hexidecimal>
-    <trynt:count>409</trynt:count>
- </trynt:color>
-
- <trynt:color rdf:about="http://www.flickr.com/photos/35034348999@N01/2269291707#000000">
-    <trynt:hexidecimal>000000</trynt:hexidecimal>
-    <trynt:count>6157</trynt:count>
- </trynt:color>
 
  <dcterms:StillImage rdf:about="http://farm3.static.flickr.com/2326/2269291707_2ec279037a_o.jpg">
     <dcterms:relation>Original</dcterms:relation>
@@ -2233,11 +2194,6 @@ This is an example of an RDF dump for a photograph backed up from Flickr :
  <flickr:tag rdf:about="http://www.flickr.com/photos/tags/cameraphone">
     <skos:prefLabel>cameraphone</skos:prefLabel>
  </flickr:tag>
-
- <trynt:color rdf:about="http://www.flickr.com/photos/35034348999@N01/2269291707#c0c0a0">
-    <trynt:hexidecimal>c0c0a0</trynt:hexidecimal>
-    <trynt:count>754</trynt:count>
- </trynt:color>
 
  <flickr:tag rdf:about="http://www.flickr.com/photos/35034348999@N01/tags/filtr">
     <skos:prefLabel>filtr</skos:prefLabel>
@@ -2252,11 +2208,6 @@ This is an example of an RDF dump for a photograph backed up from Flickr :
  <rdf:Description rdf:about="x-urn:freebsd:user">
     <rdfs:subClassOf rdf:resource="http://xmlns.com/foaf/0.1/Person"/>
  </rdf:Description>
-
- <trynt:color rdf:about="http://www.flickr.com/photos/35034348999@N01/2269291707#202020">
-    <trynt:hexidecimal>202020</trynt:hexidecimal>
-    <trynt:count>1030</trynt:count>
- </trynt:color>
 
  <flickr:tag rdf:about="http://www.flickr.com/photos/35034348999@N01/tags/sanfrancisco">
     <skos:prefLabel>sanfrancisco</skos:prefLabel>
@@ -2287,11 +2238,6 @@ This is an example of an RDF dump for a photograph backed up from Flickr :
     <rdfs:seeAlso rdf:resource="http://www.flickr.com/photos/35034348999@N01/2269291707"/>
     <rdfs:seeAlso rdf:resource="http://www.flickr.com/photos/35034348999@N01/2269291707#exif"/>
  </dcterms:StillImage>
-
- <trynt:color rdf:about="http://www.flickr.com/photos/35034348999@N01/2269291707#606060">
-    <trynt:hexidecimal>606060</trynt:hexidecimal>
-    <trynt:count>406</trynt:count>
- </trynt:color>
 
  <dcterms:StillImage rdf:about="http://farm3.static.flickr.com/2326/2269291707_bc16eb038a_t.jpg">
     <dcterms:relation>Thumbnail</dcterms:relation>
@@ -2349,11 +2295,6 @@ This is an example of an RDF dump for a photograph backed up from Flickr :
     <dc:isReferencedBy rdf:resource="http://www.flickr.com/photos/35034348999@N01/2269291707"/>
  </flickr:machinetag>
 
- <trynt:color rdf:about="http://www.flickr.com/photos/35034348999@N01/2269291707#808080">
-    <trynt:hexidecimal>808080</trynt:hexidecimal>
-    <trynt:count>1338</trynt:count>
- </trynt:color>
-
  <rdf:Description rdf:about="x-urn:flickr:machinetag">
     <rdfs:subClassOf rdf:resource="http://www.w3.org/2004/02/skos/core#Concept"/>
  </rdf:Description>
@@ -2369,11 +2310,6 @@ This is an example of an RDF dump for a photograph backed up from Flickr :
     <skos:broader rdf:resource="http://www.machinetags.org/wiki/geonames#locality"/>
     <skos:prefLabel rdf:resource="geonames:locality=5391959"/>
  </flickr:tag>
-
- <trynt:color rdf:about="http://www.flickr.com/photos/35034348999@N01/2269291707#a0a080">
-    <trynt:hexidecimal>a0a080</trynt:hexidecimal>
-    <trynt:count>570</trynt:count>
- </trynt:color>
 
  <rdf:Description rdf:about="file:///home/asc/photos/2008/02/16/20080216-2269291707-ambient_pork.jpg">
     <dcterms:created>2008-02-17T10:36:02Z</dcterms:created>
@@ -2408,16 +2344,6 @@ This is an example of an RDF dump for a photograph backed up from Flickr :
     <dcterms:isPartOf rdf:resource="http://www.flickr.com/photos/35034348999@N01/sets/72157603613223494"/>
     <a:hasAnnotation rdf:resource="http://www.flickr.com/photos/straup/2269291707/#comment72157603921497994"/>
     <geo:Point rdf:resource="http://www.flickr.com/photos/35034348999@N01/2269291707#location"/>
-    <trynt:hasColor rdf:resource="http://www.flickr.com/photos/35034348999@N01/2269291707#000000"/>
-    <trynt:hasColor rdf:resource="http://www.flickr.com/photos/35034348999@N01/2269291707#c0c0c0"/>
-    <trynt:hasColor rdf:resource="http://www.flickr.com/photos/35034348999@N01/2269291707#808080"/>
-    <trynt:hasColor rdf:resource="http://www.flickr.com/photos/35034348999@N01/2269291707#a0a0a0"/>
-    <trynt:hasColor rdf:resource="http://www.flickr.com/photos/35034348999@N01/2269291707#202020"/>
-    <trynt:hasColor rdf:resource="http://www.flickr.com/photos/35034348999@N01/2269291707#80a080"/>
-    <trynt:hasColor rdf:resource="http://www.flickr.com/photos/35034348999@N01/2269291707#c0c0a0"/>
-    <trynt:hasColor rdf:resource="http://www.flickr.com/photos/35034348999@N01/2269291707#a0a080"/>
-    <trynt:hasColor rdf:resource="http://www.flickr.com/photos/35034348999@N01/2269291707#200000"/>
-    <trynt:hasColor rdf:resource="http://www.flickr.com/photos/35034348999@N01/2269291707#606060"/>
  </flickr:photo>
 
  <computer:user rdf:about="x-urn:no#asc">
@@ -2435,11 +2361,6 @@ This is an example of an RDF dump for a photograph backed up from Flickr :
  <flickr:tag rdf:about="http://www.flickr.com/photos/tags/filtr">
     <skos:prefLabel>filtr</skos:prefLabel>
  </flickr:tag>
-
- <trynt:color rdf:about="http://www.flickr.com/photos/35034348999@N01/2269291707#a0a0a0">
-    <trynt:hexidecimal>a0a0a0</trynt:hexidecimal>
-    <trynt:count>1088</trynt:count>
- </trynt:color>
 
  <rdf:Description rdf:about="x-urn:flickr:user">
     <rdfs:subClassOf rdf:resource="http://xmlns.com/foaf/0.1/Person"/>
@@ -2475,11 +2396,6 @@ This is an example of an RDF dump for a photograph backed up from Flickr :
     <skos:broader rdf:resource="http://www.machinetags.org/wiki/ph#camera"/>
     <skos:prefLabel rdf:resource="ph:camera=n82"/>
  </flickr:tag>
-
- <trynt:color rdf:about="http://www.flickr.com/photos/35034348999@N01/2269291707#80a080">
-    <trynt:hexidecimal>80a080</trynt:hexidecimal>
-    <trynt:count>811</trynt:count>
- </trynt:color>
 
  <geoname:Feature rdf:about="http://ws.geonames.org/rdf?geonameId=5326012">
     <geoname:featureCode>PPLX</geoname:featureCode>
